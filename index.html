@@ -1049,10 +1049,9 @@ const strategy = {
 
   // ── HELPERS ──────────────────────────────────────────────
 
-  // Premium / Discount relative to the 50-candle M5 swing range
   premiumDiscount(price) {
     const m5 = candles[300];
-    if (m5.length < 20) return null;
+    if (m5.length < 10) return 'discount'; // default to allow trades when not enough data
     const sl = m5.slice(-50);
     const H = Math.max(...sl.map(c => c.high));
     const L = Math.min(...sl.map(c => c.low));
@@ -1062,253 +1061,178 @@ const strategy = {
     return 'eq';
   },
 
-  // Active kill-zone sessions — expanded for more coverage
-  sessionOk() {
-    const h = new Date().getUTCHours();
-    const asian  = (h >= 0  && h < 5);   // 00–05 UTC
-    const london = (h >= 6  && h < 13);  // 06–13 UTC
-    const ny     = (h >= 12 && h < 18);  // 12–18 UTC
-    return asian || london || ny;
-  },
-
-  // Which session is active (for display)
   activeSession() {
     const h = new Date().getUTCHours();
     if (h >= 0  && h < 5)  return 'ASIAN';
     if (h >= 6  && h < 13) return 'LONDON';
-    if (h >= 12 && h < 18) return 'NEW YORK';
-    return null;
+    if (h >= 12 && h < 20) return 'NEW YORK';
+    return 'OFF-HOURS';
   },
 
-  // Displacement candle: body ≥ 40% of range (relaxed from 65%), tiny pip floor
-  isDisplacement(c, minRangePips = 0.1) {
-    const body = Math.abs(c.close - c.open);
-    const rng  = c.high - c.low;
-    return rng >= minRangePips && body / rng >= 0.40;
-  },
-
-  // Swing detection with smaller lookback (2) to find more pivot points
-  swingHighs(arr, lb = 2) {
-    const highs = [];
-    for (let i = lb; i < arr.length - 1; i++) {
-      const w = arr.slice(i - lb, i + lb + 1);
-      if (arr[i].high === Math.max(...w.map(c => c.high))) highs.push({ idx: i, price: arr[i].high });
-    }
-    return highs;
-  },
-  swingLows(arr, lb = 2) {
-    const lows = [];
-    for (let i = lb; i < arr.length - 1; i++) {
-      const w = arr.slice(i - lb, i + lb + 1);
-      if (arr[i].low === Math.min(...w.map(c => c.low))) lows.push({ idx: i, price: arr[i].low });
-    }
-    return lows;
-  },
-
-  // ── BULLISH BMS ANALYSIS ─────────────────────────────────
-  //  Returns { valid, ob, fvg, swingBroken, sweepLow, bmsCandle }
+  // ── BULLISH: liquidity sweep of swing low + bounce = BUY ─
+  //  No BoS required. Sweep happened → price rejected → fire.
   bullishBMS() {
     const m1 = candles[60];
-    if (m1.length < 30) return { valid: false };
+    if (m1.length < 10) return { valid: false };
 
-    const arr = m1.slice(-100); // work on last 100 M1 candles
+    const arr = m1.slice(-80);
     const n   = arr.length;
 
-    // 1. Find swing highs and lows within this window
-    const sHighs = this.swingHighs(arr, 2);
-    const sLows  = this.swingLows(arr,  2);
-    if (sHighs.length < 1 || sLows.length < 1) return { valid: false };
+    // 1. Find the lowest low in the window (the liquidity pool)
+    let swingLowIdx = 0;
+    for (let i = 1; i < n - 3; i++) {
+      if (arr[i].low < arr[swingLowIdx].low) swingLowIdx = i;
+    }
+    const swingLowPrice = arr[swingLowIdx].low;
 
-    // 2. Most recent swing LOW — price must have swept it (wick below it, closed above)
-    const lastSL = sLows[sLows.length - 1];
-    // Look for a sweep candle AFTER the swing low index
+    // 2. Find a sweep: a candle AFTER the swing low that wicks below it and closes above it
+    //    OR: the swing low candle itself has a long lower wick (wick > body)
     let sweepIdx = -1;
-    for (let i = lastSL.idx + 1; i < n; i++) {
-      if (arr[i].low < lastSL.price && arr[i].close > lastSL.price) {
+    // Check candles after the swing low
+    for (let i = swingLowIdx + 1; i < n; i++) {
+      if (arr[i].low <= swingLowPrice && arr[i].close > swingLowPrice) {
         sweepIdx = i; break;
+      }
+    }
+    // Also accept the swing low candle itself as the sweep if it has a rejection wick
+    if (sweepIdx === -1) {
+      const c = arr[swingLowIdx];
+      const lowerWick = Math.min(c.open, c.close) - c.low;
+      const body = Math.abs(c.close - c.open);
+      if (lowerWick > body * 0.5 && c.close > c.low + (c.high - c.low) * 0.3) {
+        sweepIdx = swingLowIdx;
       }
     }
     if (sweepIdx === -1) return { valid: false };
 
-    // 3. Most recent swing HIGH BEFORE the sweep (the level that must be broken)
-    const relevantHighs = sHighs.filter(h => h.idx < sweepIdx);
-    if (!relevantHighs.length) return { valid: false };
-    const swingHigh = relevantHighs[relevantHighs.length - 1];
-
-    // 4. Find a displacement candle AFTER the sweep that CLOSES ABOVE the swing high
-    //    This is the BMS candle — the actual Break in Market Structure
-    let bmsIdx = -1;
+    // 3. After the sweep, at least one bullish candle (bounce confirmation)
+    let bounceIdx = -1;
     for (let i = sweepIdx + 1; i < n; i++) {
-      if (arr[i].close > swingHigh.price && arr[i].close > arr[i].open && this.isDisplacement(arr[i])) {
-        bmsIdx = i; break;
-      }
+      if (arr[i].close > arr[i].open) { bounceIdx = i; break; }
     }
-    if (bmsIdx === -1) return { valid: false };
+    // If sweep candle itself is bullish, that counts
+    if (bounceIdx === -1 && arr[sweepIdx].close > arr[sweepIdx].open) bounceIdx = sweepIdx;
+    if (bounceIdx === -1) return { valid: false };
 
-    // 5. +FVG: gap between candle[bmsIdx-2].high and candle[bmsIdx].low
-    //    FVG exists if the BMS candle or the one before it left a gap
-    let fvg = null;
-    if (bmsIdx >= 2) {
-      const c1 = arr[bmsIdx - 2], c3 = arr[bmsIdx];
-      if (c1.high < c3.low) {
-        fvg = { low: c1.high, high: c3.low };
-      }
-    }
-    // Also check one step earlier (3-candle window ending at bmsIdx-1)
-    if (!fvg && bmsIdx >= 3) {
-      const c1 = arr[bmsIdx - 3], c3 = arr[bmsIdx - 1];
-      if (c1.high < c3.low) {
-        fvg = { low: c1.high, high: c3.low };
-      }
-    }
-    // FVG is confluence — not a hard requirement on liquid M1 data
+    // 4. Sweep must be recent — within last 20 candles from the end
+    if (sweepIdx < n - 20) return { valid: false };
 
-    // 6. +OB: last BEARISH candle in the displacement leg — fall back to BMS candle if none found
-    let ob = null;
-    for (let i = bmsIdx - 1; i >= sweepIdx; i--) {
-      if (arr[i].close < arr[i].open) {
-        ob = { low: arr[i].low, high: arr[i].high, idx: i };
-        break;
-      }
-    }
-    // Fallback: use the BMS candle's body as the OB zone
-    if (!ob) ob = { low: Math.min(arr[bmsIdx].open, arr[bmsIdx].close), high: Math.max(arr[bmsIdx].open, arr[bmsIdx].close), idx: bmsIdx };
-
-    // BMS confirmed — all structural conditions met
-    return {
-      valid: true,
-      sweepLow: lastSL.price,
-      swingBroken: swingHigh.price,
-      bmsCandle: arr[bmsIdx],
-      ob,
-      fvg,
+    // 5. OB = the sweep candle body, widened by 1 pt each side
+    const sc = arr[sweepIdx];
+    const ob = {
+      low:  Math.min(sc.open, sc.close) - 1.0,
+      high: Math.max(sc.open, sc.close) + 1.0,
+      idx:  sweepIdx,
     };
+
+    // 6. Optional FVG in the bounce leg
+    let fvg = null;
+    if (bounceIdx >= 2) {
+      const c1 = arr[bounceIdx - 2], c3 = arr[bounceIdx];
+      if (c1.high < c3.low) fvg = { low: c1.high, high: c3.low };
+    }
+
+    return { valid: true, sweepLow: swingLowPrice, ob, fvg, bmsCandle: arr[bounceIdx], sweepIdx };
   },
 
-  // ── BEARISH BMS ANALYSIS ─────────────────────────────────
+  // ── BEARISH: liquidity sweep of swing high + rejection = SELL ─
   bearishBMS() {
     const m1 = candles[60];
-    if (m1.length < 30) return { valid: false };
+    if (m1.length < 10) return { valid: false };
 
-    const arr = m1.slice(-100);
+    const arr = m1.slice(-80);
     const n   = arr.length;
 
-    const sHighs = this.swingHighs(arr, 2);
-    const sLows  = this.swingLows(arr,  2);
-    if (sHighs.length < 1 || sLows.length < 1) return { valid: false };
+    // 1. Find the highest high in the window
+    let swingHighIdx = 0;
+    for (let i = 1; i < n - 3; i++) {
+      if (arr[i].high > arr[swingHighIdx].high) swingHighIdx = i;
+    }
+    const swingHighPrice = arr[swingHighIdx].high;
 
-    // 2. Most recent swing HIGH — price must have swept it (wick above, closed below)
-    const lastSH = sHighs[sHighs.length - 1];
+    // 2. Find a sweep: candle after swing high that wicks above and closes below
     let sweepIdx = -1;
-    for (let i = lastSH.idx + 1; i < n; i++) {
-      if (arr[i].high > lastSH.price && arr[i].close < lastSH.price) {
+    for (let i = swingHighIdx + 1; i < n; i++) {
+      if (arr[i].high >= swingHighPrice && arr[i].close < swingHighPrice) {
         sweepIdx = i; break;
+      }
+    }
+    // Also accept the swing high candle itself if it has a rejection upper wick
+    if (sweepIdx === -1) {
+      const c = arr[swingHighIdx];
+      const upperWick = c.high - Math.max(c.open, c.close);
+      const body = Math.abs(c.close - c.open);
+      if (upperWick > body * 0.5 && c.close < c.high - (c.high - c.low) * 0.3) {
+        sweepIdx = swingHighIdx;
       }
     }
     if (sweepIdx === -1) return { valid: false };
 
-    // 3. Swing LOW before the sweep that must be broken
-    const relevantLows = sLows.filter(l => l.idx < sweepIdx);
-    if (!relevantLows.length) return { valid: false };
-    const swingLow = relevantLows[relevantLows.length - 1];
-
-    // 4. BMS candle: displacement candle after sweep that CLOSES BELOW swing low
-    let bmsIdx = -1;
+    // 3. After the sweep, at least one bearish candle (rejection confirmation)
+    let bounceIdx = -1;
     for (let i = sweepIdx + 1; i < n; i++) {
-      if (arr[i].close < swingLow.price && arr[i].close < arr[i].open && this.isDisplacement(arr[i])) {
-        bmsIdx = i; break;
-      }
+      if (arr[i].close < arr[i].open) { bounceIdx = i; break; }
     }
-    if (bmsIdx === -1) return { valid: false };
+    if (bounceIdx === -1 && arr[sweepIdx].close < arr[sweepIdx].open) bounceIdx = sweepIdx;
+    if (bounceIdx === -1) return { valid: false };
 
-    // 5. -FVG: gap between candle[bmsIdx-2].low and candle[bmsIdx].high
-    let fvg = null;
-    if (bmsIdx >= 2) {
-      const c1 = arr[bmsIdx - 2], c3 = arr[bmsIdx];
-      if (c1.low > c3.high) {
-        fvg = { low: c3.high, high: c1.low };
-      }
-    }
-    if (!fvg && bmsIdx >= 3) {
-      const c1 = arr[bmsIdx - 3], c3 = arr[bmsIdx - 1];
-      if (c1.low > c3.high) {
-        fvg = { low: c3.high, high: c1.low };
-      }
-    }
-    // FVG is confluence — not a hard requirement on liquid M1 data
+    // 4. Sweep must be recent — within last 20 candles from the end
+    if (sweepIdx < n - 20) return { valid: false };
 
-    // 6. -OB: last BULLISH candle in the displacement leg — fall back to BMS candle if none found
-    let ob = null;
-    for (let i = bmsIdx - 1; i >= sweepIdx; i--) {
-      if (arr[i].close > arr[i].open) {
-        ob = { low: arr[i].low, high: arr[i].high, idx: i };
-        break;
-      }
-    }
-    // Fallback: use the BMS candle's body as the OB zone
-    if (!ob) ob = { low: Math.min(arr[bmsIdx].open, arr[bmsIdx].close), high: Math.max(arr[bmsIdx].open, arr[bmsIdx].close), idx: bmsIdx };
-
-    return {
-      valid: true,
-      sweepHigh: lastSH.price,
-      swingBroken: swingLow.price,
-      bmsCandle: arr[bmsIdx],
-      ob,
-      fvg,
+    // 5. OB = sweep candle body ± 1 pt
+    const sc = arr[sweepIdx];
+    const ob = {
+      low:  Math.min(sc.open, sc.close) - 1.0,
+      high: Math.max(sc.open, sc.close) + 1.0,
+      idx:  sweepIdx,
     };
+
+    // 6. Optional FVG
+    let fvg = null;
+    if (bounceIdx >= 2) {
+      const c1 = arr[bounceIdx - 2], c3 = arr[bounceIdx];
+      if (c1.low > c3.high) fvg = { low: c3.high, high: c1.low };
+    }
+
+    return { valid: true, sweepHigh: swingHighPrice, ob, fvg, bmsCandle: arr[bounceIdx], sweepIdx };
   },
 
   // ── EXPOSED ACCESSORS (for chart drawing) ─────────────────
-  bullishOB() {
-    const r = this.bullishBMS();
-    return r.valid ? r.ob : null;
-  },
-  bearishOB() {
-    const r = this.bearishBMS();
-    return r.valid ? r.ob : null;
-  },
-  bullishFVGZone() {
-    const r = this.bullishBMS();
-    return r.valid ? r.fvg : null;
-  },
-  bearishFVGZone() {
-    const r = this.bearishBMS();
-    return r.valid ? r.fvg : null;
-  },
+  bullishOB()     { const r = this.bullishBMS(); return r.valid ? r.ob  : null; },
+  bearishOB()     { const r = this.bearishBMS(); return r.valid ? r.ob  : null; },
+  bullishFVGZone(){ const r = this.bullishBMS(); return r.valid ? r.fvg : null; },
+  bearishFVGZone(){ const r = this.bearishBMS(); return r.valid ? r.fvg : null; },
 
   // ── ENTRY EVALUATION ──────────────────────────────────────
   evalBuy(price) {
-    const sess = this.sessionOk(); // kept for display label only — no longer gates trades
-    const bms  = this.bullishBMS();
+    const sess  = this.activeSession();
+    const bms   = this.bullishBMS();
     const bmsOk = bms.valid;
 
-    // Price inside OB or FVG — add a small buffer (0.3 pts) so near-misses still trigger
-    const BUF = 0.3;
-    const inOB  = bmsOk && price >= bms.ob.low - BUF && price <= bms.ob.high + BUF;
-    const inFVG = bmsOk && bms.fvg && price >= bms.fvg.low - BUF && price <= bms.fvg.high + BUF;
-    const inZone = inOB || inFVG;
-
+    // Price is above the sweep low (not still falling) — that's all we need
+    const aboveSweep = bmsOk && price > bms.sweepLow;
     const zone = this.premiumDiscount(price);
     const isDiscount = zone === 'discount';
 
-    const m1 = candles[60];
-    const closedC = m1.length >= 2 ? m1[m1.length - 2] : null;
-    const candleConf = closedC ? (closedC.close > closedC.open) : false;
+    // Optional: price inside wide OB zone (for display tracking)
+    const inOB  = bmsOk && price >= bms.ob.low && price <= bms.ob.high;
+    const inFVG = bmsOk && bms.fvg && price >= bms.fvg.low && price <= bms.fvg.high;
+    const inZone = inOB || inFVG;
 
-    // Signal: BMS confirmed + price in zone — session and candle direction are display-only
-    const signal = bmsOk && inZone;
+    // SIGNAL: sweep confirmed + bounce confirmed + price above sweep low → BUY
+    const signal = bmsOk && aboveSweep;
 
     return {
       signal,
       conds: {
-        bSess:    sess,
-        bBMS:     bmsOk,
-        bSweep:   bmsOk,
-        bDisp:    bmsOk,
-        bFVG:     bmsOk && !!bms.fvg,
-        bOB:      bmsOk,
-        bHL:      inZone,
-        bEntry:   inZone && isDiscount && candleConf,
+        bSess:  true,
+        bBMS:   bmsOk,
+        bSweep: bmsOk,
+        bDisp:  bmsOk,
+        bFVG:   bmsOk && !!bms.fvg,
+        bOB:    bmsOk,
+        bHL:    aboveSweep,
+        bEntry: bmsOk && aboveSweep,
       },
       ob:  bmsOk ? bms.ob  : null,
       fvg: bmsOk ? bms.fvg : null,
@@ -1316,36 +1240,33 @@ const strategy = {
   },
 
   evalSell(price) {
-    const sess = this.sessionOk(); // kept for display label only — no longer gates trades
-    const bms  = this.bearishBMS();
+    const sess  = this.activeSession();
+    const bms   = this.bearishBMS();
     const bmsOk = bms.valid;
 
-    const BUF = 0.3;
-    const inOB  = bmsOk && price >= bms.ob.low - BUF && price <= bms.ob.high + BUF;
-    const inFVG = bmsOk && bms.fvg && price >= bms.fvg.low - BUF && price <= bms.fvg.high + BUF;
-    const inZone = inOB || inFVG;
-
+    // Price is below the sweep high (not still rising) — that's all we need
+    const belowSweep = bmsOk && price < bms.sweepHigh;
     const zone = this.premiumDiscount(price);
     const isPremium = zone === 'premium';
 
-    const m1 = candles[60];
-    const closedC = m1.length >= 2 ? m1[m1.length - 2] : null;
-    const candleConf = closedC ? (closedC.close < closedC.open) : false;
+    const inOB  = bmsOk && price >= bms.ob.low && price <= bms.ob.high;
+    const inFVG = bmsOk && bms.fvg && price >= bms.fvg.low && price <= bms.fvg.high;
+    const inZone = inOB || inFVG;
 
-    // Signal: BMS confirmed + price in zone — session and candle direction are display-only
-    const signal = bmsOk && inZone;
+    // SIGNAL: sweep confirmed + rejection confirmed + price below sweep high → SELL
+    const signal = bmsOk && belowSweep;
 
     return {
       signal,
       conds: {
-        sSess:  sess,
+        sSess:  true,
         sBMS:   bmsOk,
         sSweep: bmsOk,
         sDisp:  bmsOk,
         sFVG:   bmsOk && !!bms.fvg,
         sOB:    bmsOk,
-        sLH:    inZone,
-        sEntry: inZone && isPremium && candleConf,
+        sLH:    belowSweep,
+        sEntry: bmsOk && belowSweep,
       },
       ob:  bmsOk ? bms.ob  : null,
       fvg: bmsOk ? bms.fvg : null,
